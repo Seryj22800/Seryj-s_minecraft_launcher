@@ -10,28 +10,67 @@ from pathlib import Path
 import threading
 import ctypes
 import platform
-import logging
 import uuid
 import time
 import requests
 import urllib.error
 from PIL import Image, ImageTk
 import sv_ttk
+import logging
+from colorama import init, Fore, Style
+init(autoreset=True)
+
+adapter = requests.adapters.HTTPAdapter(pool_connections=100, pool_maxsize=100)
+session = requests.Session()
+session.mount('http://', adapter)
+session.mount('https://', adapter)
+requests.api.request = session.request
 
 # Настройка подробного логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] [%(levelname)s] %(message)s',
-    datefmt='%H:%M:%S'
-)
+class ColoredFormatter(logging.Formatter):
+    """Кастомный форматер, который красит логи в зависимости от уровня важности"""
+    COLORS = {
+        logging.DEBUG: Fore.CYAN,
+        logging.INFO: Fore.GREEN,
+        logging.WARNING: Fore.YELLOW,
+        logging.ERROR: Fore.RED,
+        logging.CRITICAL: Fore.MAGENTA + Style.BRIGHT
+    }
 
-# Включаем поддержку высокого DPI для Windows
+    def format(self, record):
+        color = self.COLORS.get(record.levelno, Fore.WHITE)
+        # Формируем префикс времени и уровня (белый/серый), а само сообщение — цветным
+        log_fmt = f"{Fore.WHITE}[%(asctime)s] [{color}%(levelname)s{Fore.WHITE}] {color}%(message)s"
+        formatter = logging.Formatter(log_fmt, datefmt='%H:%M:%S')
+        return formatter.format(record)
+
+# Настраиваем корневой логгер
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# Создаем обработчик для вывода в консоль
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(ColoredFormatter())
+logger.addHandler(console_handler)
+
 try:
     if platform.system() == "Windows":
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
         logging.debug("DPI awareness успешно активирован.")
 except Exception as e:
     logging.debug(f"Не удалось установить DPI awareness: {e}")
+
+# Устанавливает короткое имя SML в заголовок консоли
+try:
+    if platform.system() == "Windows":
+        import ctypes
+        ctypes.windll.kernel32.SetConsoleTitleW("SML")
+    else:
+        sys.stdout.write("\x1b]2;SML\x07")
+        sys.stdout.flush()
+except Exception:
+    pass
+
 
 def open_folder_crossplatform(path):
     """Кроссплатформенное открытие папки"""
@@ -49,7 +88,7 @@ class ConfigManager:
         self.config_file = os.path.join(launcher_dir, "launcher_settings.json")
         self.data = {
             "java_path": "",
-            "java_args": "-Dfml.ignoreInvalidMinecraftCertificates=true",
+            "java_args": "",
             "max_ram": 2048,
             "version_names": {},
             "usernames": ["Steve"],
@@ -193,9 +232,9 @@ class MinecraftCore:
             "uuid": session_uuid,
             "token": "",
             "gameDirectory": game_dir,
-            "jvmArguments": java_args
+            "jvmArguments": []
         }
-        
+        #java_args
         java_path = self.config.data.get("java_path", "").strip()
         if java_path and os.path.exists(java_path):
             options["executablePath"] = java_path
@@ -205,9 +244,10 @@ class MinecraftCore:
         try:
             java_idx = next(i for i, p in enumerate(cmd) if 'java' in p.lower() or 'javaw' in p.lower())
             mem_end = java_idx + 1
+            custom_jvm_inject = java_args + [f"-Dminecraft.logs={logs_dir}"]
             while mem_end < len(cmd) and cmd[mem_end].startswith('-X'):
                 mem_end += 1
-            cmd = cmd[:mem_end] + [f"-Dminecraft.logs={logs_dir}"] + cmd[mem_end:]
+            cmd = cmd[:mem_end] + custom_jvm_inject + cmd[mem_end:]
         except StopIteration:
             pass
 
@@ -217,8 +257,8 @@ class MinecraftCore:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            bufsize=1,
-            creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
+            errors='replace',
+            bufsize=1
         )
         self.is_running = True
         return self.process
@@ -266,7 +306,13 @@ class MinecraftLauncherGUI:
         }
         self.root.configure(bg=self.colors['bg'])
         
-        self.launcher_dir = str(Path(__file__).parent.absolute())
+        if getattr(sys, 'frozen', False):
+            # Если это скомпилированный EXE
+            self.launcher_dir = str(Path(sys.executable).parent.absolute())
+        else:
+            # Если это обычный .py скрипт
+            self.launcher_dir = str(Path(__file__).parent.absolute())
+
         self.config_manager = ConfigManager(self.launcher_dir)
         self.core = MinecraftCore(self.launcher_dir, self.config_manager)
         
@@ -504,7 +550,7 @@ class MinecraftLauncherGUI:
         self.config_manager.data["java_path"] = self.java_var.get().strip()
         self.config_manager.data["java_args"] = self.args_var.get().strip()
         self.config_manager.save()
-        
+
         self.bottom_ram_info.config(text=f'{ram_val} MB')
         messagebox.showinfo("Успех", "Настройки сохранены")
 
@@ -538,6 +584,9 @@ class MinecraftLauncherGUI:
 
     def on_version_select(self, event):
         selection = self.versions_listbox.curselection()
+        if not selection:
+            logging.warning("Попытка выбора версии при пустом списке или отсутствии выбора.")
+            return
         if selection:
             idx = selection[0]
             self.selected_version = self.installed_versions_cache[idx]
@@ -567,13 +616,25 @@ class MinecraftLauncherGUI:
                 logging.info("=== Захват вывода Minecraft ===")
                 for line in iter(process.stdout.readline, ''):
                     if line:
-                        logging.info(f"[Minecraft] {line.strip()}")
+                        cleaned_line = line.strip()
+                        upper_line = cleaned_line.upper()
+                        
+                        # Проверяем строку на наличие критических ошибок
+                        if "ERROR" in upper_line or "FATAL" in upper_line or "EXCEPTION" in upper_line or "[STDERR]" in upper_line:
+                            logging.error(f"[Minecraft] {cleaned_line}")
+                        # Проверяем на предупреждения
+                        elif "WARN" in upper_line or "WARNING" in upper_line:
+                            logging.warning(f"[Minecraft] {cleaned_line}")
+                        # Обычный информационный лог
+                        else:
+                            logging.info(f"[Minecraft] {cleaned_line}")
                 
                 process.stdout.close()
                 process.wait()
                 
                 self.core.is_running = False
                 logging.info("=== Minecraft закрыт ===")
+
                 
             threading.Thread(target=monitor_and_log, daemon=True).start()
         except Exception as e:
